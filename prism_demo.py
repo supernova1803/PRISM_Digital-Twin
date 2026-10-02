@@ -1,1208 +1,267 @@
-'''
-# PRISM – 50% Demo Pipeline
-# Local Memory + Local LLM Integration (Fixed & Stable)
+"""PRISM: a local chat app with editable, persistent personal memories."""
 
-"""
-This script demonstrates:
-1. Loading sample user data
-2. Creating simple embeddings (bag-of-words)
-3. Storing and retrieving memory
-4. Sending retrieved memory + user question to a local LLM via Ollama HTTP API
-
-This version:
-- Fixes the unterminated string error
-- Ensures stable fallback behavior when Ollama is unavailable
-- Adds extra tests to validate summarization and retrieval
-"""
+import json
+import os
+import sqlite3
+from datetime import datetime, timezone
+from urllib import error, request
 
 import numpy as np
-import re
-import json
-from urllib import request, error
+import streamlit as st
 
-# -----------------------------
-# Utility: Tokenizer
-# -----------------------------
-def tokenize(text):
-    text = text.lower()
-    return re.findall(r"[a-z0-9]+", text)
 
-# -----------------------------
-# 1. Sample User Data
-# -----------------------------
-user_texts = [
-    "I love working on robotics and embedded systems.",
-    "I usually write code in Python and Java.",
-    "I enjoy making DIY electronics projects.",
-    "My cat often interrupts me while coding.",
-    "I like solving AI and machine learning problems.",
-]
+DB_FILE = "prism_memory.db"
+LEGACY_MEMORY_FILE = "memory_store.json"
+EMBED_URL = "http://localhost:11434/api/embeddings"
+LLM_URL = "http://localhost:11434/api/generate"
+EMBED_MODEL = "nomic-embed-text"
+CHAT_MODEL = "mistral"
+HISTORY_TURNS = 6
 
-# -----------------------------
-# 2. Build Vocabulary
-# -----------------------------
-all_tokens = []
-for text in user_texts:
-    all_tokens.extend(tokenize(text))
 
-vocab = sorted(set(all_tokens))
-vocab_index = {word: i for i, word in enumerate(vocab)}
+def get_embedding(text):
+    """Return an Ollama embedding or raise a readable error; never fake one."""
+    payload = json.dumps({"model": EMBED_MODEL, "prompt": text}).encode("utf-8")
+    req = request.Request(EMBED_URL, data=payload,
+                          headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with request.urlopen(req, timeout=60) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        vector = np.asarray(data["embedding"], dtype=np.float32)
+        if vector.ndim != 1 or vector.size == 0 or not np.isfinite(vector).all():
+            raise ValueError("Ollama returned an invalid embedding.")
+        return vector.tolist()
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Ollama embedding request failed ({exc.code}): {detail or exc.reason}") from exc
+    except error.URLError as exc:
+        raise RuntimeError("Cannot reach Ollama at localhost:11434. Start Ollama and install the "
+                           f"{EMBED_MODEL} model (`ollama pull {EMBED_MODEL}`).") from exc
+    except (KeyError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"Could not read an embedding from Ollama: {exc}") from exc
 
-# -----------------------------
-# 3. Create Embeddings (Bag-of-Words)
-# -----------------------------
-def text_to_vector(text):
-    vec = np.zeros(len(vocab), dtype=np.float32)
-    for token in tokenize(text):
-        if token in vocab_index:
-            vec[vocab_index[token]] += 1.0
-    return vec
 
-embeddings = np.array([text_to_vector(t) for t in user_texts], dtype=np.float32)
+def connect_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""CREATE TABLE IF NOT EXISTS memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        embedding TEXT
+    )""")
+    conn.execute("CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.commit()
+    return conn
 
-# -----------------------------
-# 4. Vector Similarity + Retrieval
-# -----------------------------
+
+def initialize_memory_store():
+    """Create the SQLite store and migrate legacy memory text once, without losing it."""
+    conn = connect_db()
+    imported = conn.execute("SELECT value FROM app_state WHERE key='legacy_imported'").fetchone()
+    if imported is None:
+        try:
+            if os.path.exists(LEGACY_MEMORY_FILE):
+                with open(LEGACY_MEMORY_FILE, "r", encoding="utf-8") as source:
+                    legacy = json.load(source)
+                texts = legacy.get("texts", []) if isinstance(legacy, dict) else []
+                now = datetime.now(timezone.utc).isoformat()
+                conn.executemany("INSERT INTO memories(text, created_at) VALUES(?, ?)",
+                                 [(str(text).strip(), now) for text in texts if str(text).strip()])
+            conn.execute("INSERT INTO app_state(key, value) VALUES('legacy_imported', 'true')")
+            conn.commit()
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            conn.close()
+            raise RuntimeError(f"Could not import existing {LEGACY_MEMORY_FILE}: {exc}") from exc
+    return conn
+
+
+def list_memories(conn):
+    return conn.execute("SELECT id, text, created_at, embedding FROM memories ORDER BY id").fetchall()
+
+
+def add_memory(conn, text):
+    vector = get_embedding(text)
+    conn.execute("INSERT INTO memories(text, created_at, embedding) VALUES(?, ?, ?)",
+                 (text, datetime.now(timezone.utc).isoformat(), json.dumps(vector)))
+    conn.commit()
+
+
+def update_memory(conn, memory_id, text):
+    vector = get_embedding(text)
+    conn.execute("UPDATE memories SET text=?, embedding=? WHERE id=?",
+                 (text, json.dumps(vector), memory_id))
+    conn.commit()
+
+
+def delete_memory(conn, memory_id):
+    conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+    conn.commit()
+
+
 def cosine_similarity(a, b):
-    denom = (np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    if a.ndim != 1 or b.ndim != 1 or a.size != b.size:
+        raise RuntimeError("Memory embeddings have inconsistent dimensions. Re-save the affected memory.")
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    return float(np.dot(a, b) / denom) if denom else 0.0
 
 
-def retrieve(query, k=2):
-    q_vec = text_to_vector(query)
-    scores = [cosine_similarity(q_vec, emb) for emb in embeddings]
-    top_k = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
-    return [user_texts[i] for i in top_k]
-
-# -----------------------------
-# 5. Local LLM Call via Ollama HTTP API
-# -----------------------------
-OLLAMA_URL = "http://localhost:11434/api/generate"
-
-
-def summarize_memories(memories):
-    """Create a simple summary from memories using frequency analysis."""
+def retrieve(query, memories, k=3):
     if not memories:
-        return ""
+        return []
+    query_vector = get_embedding(query)
+    scored = []
+    for memory in memories:
+        if not memory["embedding"]:
+            vector = get_embedding(memory["text"])
+            memory_id = memory["id"]
+            # Cache vectors from legacy imports; if Ollama fails, report the error.
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.execute("UPDATE memories SET embedding=? WHERE id=?", (json.dumps(vector), memory_id))
+            memory = dict(memory)
+            memory["embedding"] = json.dumps(vector)
+        vector = json.loads(memory["embedding"])
+        scored.append((cosine_similarity(query_vector, vector), memory["text"]))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [text for score, text in scored[:min(k, len(scored))] if score > 0]
 
-    tokens = []
-    for m in memories:
-        tokens.extend(tokenize(m))
 
-    freq = {}
-    for t in tokens:
-        freq[t] = freq.get(t, 0) + 1
+def ask_llm(prompt):
+    payload = json.dumps({"model": CHAT_MODEL, "prompt": prompt, "stream": False}).encode("utf-8")
+    req = request.Request(LLM_URL, data=payload,
+                          headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with request.urlopen(req, timeout=120) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        answer = data.get("response", "").strip()
+        if not answer:
+            raise RuntimeError("Ollama returned an empty response.")
+        return answer
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Ollama chat request failed ({exc.code}): {detail or exc.reason}") from exc
+    except error.URLError as exc:
+        raise RuntimeError(f"Cannot reach Ollama. Start it and install the {CHAT_MODEL} model "
+                           f"(`ollama pull {CHAT_MODEL}`).") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Ollama returned an unreadable response: {exc}") from exc
 
-    keywords = sorted(freq, key=freq.get, reverse=True)[:5]
-    return "The user often focuses on " + ", ".join(keywords) + "."
 
-
-def ask_llm(prompt, model="mistral", fallback_memories=None):
-    payload = json.dumps({
-        "model": model,
-        "prompt": prompt,
-        "stream": False
-    }).encode("utf-8")
-
-    req = request.Request(
-        OLLAMA_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
+def build_prompt(history, user_text, memories):
+    recent = history[-HISTORY_TURNS * 2:]
+    conversation = "\n".join(
+        f"{('User' if item['role'] == 'user' else 'PRISM')}: {item['content']}"
+        for item in recent
     )
+    memory_context = "\n".join(f"- {text}" for text in memories) or "No relevant memories found."
+    return f"""You are PRISM, a helpful personal assistant.
+Use the conversation to understand follow-up questions. Use memories only as evidence
+about the user's personal facts. Do not invent personal details; if memories do not
+answer a personal question, say you do not know. You may answer general questions
+using general knowledge.
 
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("response", "(no response)")
-    except error.URLError:
-        if fallback_memories:
-            return "[Local intelligent summary] " + summarize_memories(fallback_memories)
-        return "[Mock LLM] Ollama not reachable and no fallback available."
-    except Exception as e:
-        return f"LLM error: {e}"
+Relevant memories:
+{memory_context}
 
-# -----------------------------
-# 6. End-to-End Query
-# -----------------------------
-query = "What are my interests?"
-memories = retrieve(query)
+Recent conversation:
+{conversation or '(start of conversation)'}
 
-context = "\n".join(memories)
+User: {user_text}
+PRISM:"""
 
-prompt = f"""
-You are a personal digital twin of the user.
-Use the memories below AND your own general knowledge to provide the best possible answer.
-Blend the user's known preferences with general reasoning to fill in gaps.
-Respond naturally in the user's style.
 
-Memories:
-{context}
-
-Question:
-{query}
-"""
-
-print("\n=== Retrieved Memory ===")
-print(context)
-
-print("\n=== LLM Response ===")
-print(ask_llm(prompt, fallback_memories=memories))
-
-# -----------------------------
-# Tests
-# -----------------------------
-assert len(vocab) > 0, "Vocabulary must not be empty."
-assert embeddings.shape[0] == len(user_texts), "Each text must have an embedding."
-assert len(memories) > 0, "Memory retrieval failed."
-
-# Additional tests
-assert isinstance(memories, list), "Retrieved memories should be a list."
-assert len(retrieve("coding")) > 0, "Retrieval should return results for valid query."
-assert isinstance(ask_llm("test prompt"), str), "LLM output must be a string."
-
-# New tests for fallback summarization
-summary_test = summarize_memories(["I love robotics and electronics"])
-assert "robotics" in summary_test or "electronics" in summary_test, "Summary must reflect input memories."
-
-print("\nAll tests passed. Pipeline OK.")
-'''
-
-
-#new changes 1
-'''
-# PRISM – 60% Demo Pipeline
-# Semantic Memory + Local LLM Integration
-
-"""
-This version upgrades the system to use REAL semantic embeddings via Ollama.
-
-New Features:
-1. Semantic embeddings (nomic-embed-text)
-2. Better memory retrieval (meaning-based)
-3. Local LLM response generation
-4. Intelligent fallback summarization
-
-Requirements:
-- Ollama running
-- Models installed:
-    ollama pull mistral
-    ollama pull nomic-embed-text
-"""
-
-import numpy as np
-import json
-from urllib import request, error
-
-# -----------------------------
-# 1. Sample User Data
-# -----------------------------
-user_texts = [
-    "I love working on robotics and embedded systems.",
-    "I usually write code in Python and Java.",
-    "I enjoy making DIY electronics projects.",
-    "My cat often interrupts me while coding.",
-    "I like solving AI and machine learning problems.",
-]
-
-# -----------------------------
-# 2. Embedding via Ollama
-# -----------------------------
-EMBED_URL = "http://localhost:11434/api/embeddings"
-
-
-def get_embedding(text):
-    payload = json.dumps({
-        "model": "nomic-embed-text",
-        "prompt": text
-    }).encode("utf-8")
-
-    req = request.Request(
-        EMBED_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return np.array(data["embedding"], dtype=np.float32)
-    except Exception:
-        # fallback to random vector (keeps system running)
-        return np.random.rand(768).astype(np.float32)
-
-# -----------------------------
-# 3. Create Embeddings
-# -----------------------------
-print("Creating semantic embeddings...")
-embeddings = np.array([get_embedding(t) for t in user_texts])
-
-# -----------------------------
-# 4. Similarity + Retrieval
-# -----------------------------
-def cosine_similarity(a, b):
-    denom = (np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
-
-
-def retrieve(query, k=2):
-    q_vec = get_embedding(query)
-    scores = [cosine_similarity(q_vec, emb) for emb in embeddings]
-    top_k = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
-    return [user_texts[i] for i in top_k]
-
-# -----------------------------
-# 5. LLM via Ollama
-# -----------------------------
-LLM_URL = "http://localhost:11434/api/generate"
-
-
-def summarize_memories(memories):
-    text = " ".join(memories)
-    return f"The user is interested in: {text[:100]}..."
-
-
-def ask_llm(prompt, fallback_memories=None):
-    payload = json.dumps({
-        "model": "mistral",
-        "prompt": prompt,
-        "stream": False
-    }).encode("utf-8")
-
-    req = request.Request(
-        LLM_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("response", "(no response)")
-    except error.URLError:
-        if fallback_memories:
-            return "[Fallback] " + summarize_memories(fallback_memories)
-        return "LLM unavailable"
-
-# -----------------------------
-# 6. End-to-End Query
-# -----------------------------
-query = "What do I like to build?"
-memories = retrieve(query)
-
-context = "\n".join(memories)
-
-prompt = f"""
-You are a personal AI digital twin.
-Use memory + general knowledge.
-
-Memories:
-{context}
-
-Question:
-{query}
-"""
-
-print("\n=== Retrieved Memory ===")
-print(context)
-
-print("\n=== LLM Response ===")
-print(ask_llm(prompt, fallback_memories=memories))
-
-# -----------------------------
-# Tests
-# -----------------------------
-assert len(embeddings) == len(user_texts)
-assert len(retrieve("coding")) > 0
-assert isinstance(ask_llm("test"), str)
-
-print("\nAll tests passed. Semantic pipeline working.")
-'''
-
-#new changes 2
-'''
-# PRISM – 70% Demo Pipeline
-# Semantic Memory + Persistent Storage + Local LLM
-
-"""
-New Features Added:
-1. Semantic embeddings (Ollama)
-2. Persistent memory (save/load from disk)
-3. Improved retrieval
-4. Local LLM + fallback
-
-Requirements:
-- ollama pull mistral
-- ollama pull nomic-embed-text
-"""
-
-import numpy as np
-import json
-import os
-from urllib import request, error
-
-# -----------------------------
-# Config
-# -----------------------------
-MEMORY_FILE = "memory_store.json"
-EMBED_URL = "http://localhost:11434/api/embeddings"
-LLM_URL = "http://localhost:11434/api/generate"
-
-# -----------------------------
-# 1. Initial Data (used only if no memory file exists)
-# -----------------------------
-def get_initial_data():
-    return [
-        "I love working on python projects",
-        "I usually write code in Python and Java.",
-        "I enjoy making DIY electronics projects.",
-        "My cat often interrupts me while coding.",
-        "I like to spend time in my garden.",
-    ]
-
-# -----------------------------
-# 2. Embedding Function
-# -----------------------------
-def get_embedding(text):
-    payload = json.dumps({
-        "model": "nomic-embed-text",
-        "prompt": text
-    }).encode("utf-8")
-
-    req = request.Request(
-        EMBED_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["embedding"]
-    except Exception:
-        return np.random.rand(768).tolist()
-
-# -----------------------------
-# 3. Memory Save/Load
-# -----------------------------
-def save_memory(texts, embeddings):
-    data = {
-        "texts": texts,
-        "embeddings": embeddings
-    }
-    with open(MEMORY_FILE, "w") as f:
-        json.dump(data, f)
-
-
-def load_memory():
-    if not os.path.exists(MEMORY_FILE):
-        return None, None
-
-    with open(MEMORY_FILE, "r") as f:
-        data = json.load(f)
-        return data["texts"], data["embeddings"]
-
-# -----------------------------
-# 4. Initialize Memory
-# -----------------------------
-texts, embeddings = load_memory()
-
-if texts is None:
-    print("Creating memory store...")
-    texts = get_initial_data()
-    embeddings = [get_embedding(t) for t in texts]
-    save_memory(texts, embeddings)
-else:
-    print("Loaded existing memory.")
-
-embeddings = np.array(embeddings, dtype=np.float32)
-
-# -----------------------------
-# 5. Retrieval
-# -----------------------------
-def cosine_similarity(a, b):
-    denom = (np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
-
-
-def retrieve(query, k=2):
-    q_vec = np.array(get_embedding(query), dtype=np.float32)
-    scores = [cosine_similarity(q_vec, emb) for emb in embeddings]
-    top_k = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
-    return [texts[i] for i in top_k]
-
-# -----------------------------
-# 6. Add New Memory
-# -----------------------------
-def add_memory(new_text):
-    global texts, embeddings
-
-    texts.append(new_text)
-    new_emb = np.array(get_embedding(new_text), dtype=np.float32)
-    embeddings = np.vstack([embeddings, new_emb])
-
-    save_memory(texts, embeddings.tolist())
-
-# -----------------------------
-# 7. LLM
-# -----------------------------
-def ask_llm(prompt, fallback_memories=None):
-    payload = json.dumps({
-        "model": "mistral",
-        "prompt": prompt,
-        "stream": False
-    }).encode("utf-8")
-
-    req = request.Request(
-        LLM_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("response", "(no response)")
-    except error.URLError:
-        if fallback_memories:
-            return "[Fallback] " + " ".join(fallback_memories)
-        return "LLM unavailable"
-
-# -----------------------------
-# 8. Run Query
-# -----------------------------
-query = "What do I like to build?"
-memories = retrieve(query)
-
-context = "\n".join(memories)
-
-prompt = f"""
-You are a personal AI digital twin.
-Use memory + general knowledge.
-
-Memories:
-{context}
-
-Question:
-{query}
-"""
-
-print("\n=== Retrieved Memory ===")
-print(context)
-
-print("\n=== LLM Response ===")
-print(ask_llm(prompt, fallback_memories=memories))
-
-# -----------------------------
-# 9. Demo: Add New Memory
-# -----------------------------
-add_memory("I recently started learning cloud computing and AWS.")
-
-# -----------------------------
-# Tests
-# -----------------------------
-assert len(texts) > 0
-assert embeddings.shape[0] == len(texts)
-assert len(retrieve("coding")) > 0
-
-print("\nAll tests passed. Persistent memory working.")
-add_memory("i have a lot of plants and i like to do plant works when i feel stressed")
-'''
-
-#new changes 3
-'''
-# PRISM – 80% Demo Pipeline
-# Semantic Memory + Persistent Storage + Personality Modeling
-
-"""
-New Features Added:
-1. Semantic embeddings (Ollama)
-2. Persistent memory (save/load)
-3. Personality modeling (style imitation)
-4. Local LLM + fallback
-
-Requirements:
-- ollama pull mistral
-- ollama pull nomic-embed-text
-"""
-
-import numpy as np
-import json
-import os
-from urllib import request, error
-
-# -----------------------------
-# Config
-# -----------------------------
-MEMORY_FILE = "memory_store.json"
-PROFILE_FILE = "personality.json"
-EMBED_URL = "http://localhost:11434/api/embeddings"
-LLM_URL = "http://localhost:11434/api/generate"
-
-# -----------------------------
-# 1. Initial Data
-# -----------------------------
-def get_initial_data():
-    return [
-        "I love working on robotics and embedded systems.",
-        "I usually write code in Python and Java.",
-        "I enjoy making DIY electronics projects.",
-        "My cat often interrupts me while coding.",
-        "I like solving AI and machine learning problems.",
-    ]
-
-# -----------------------------
-# 2. Personality Profile
-# -----------------------------
-def create_personality_profile(texts):
-    profile = {
-        "tone": "technical and enthusiastic",
-        "style": "concise but expressive",
-        "interests": ", ".join(texts[:3])
-    }
-    with open(PROFILE_FILE, "w") as f:
-        json.dump(profile, f)
-    return profile
-
-
-def load_personality():
-    if not os.path.exists(PROFILE_FILE):
-        return None
-    with open(PROFILE_FILE, "r") as f:
-        return json.load(f)
-
-# -----------------------------
-# 3. Embedding
-# -----------------------------
-def get_embedding(text):
-    payload = json.dumps({
-        "model": "nomic-embed-text",
-        "prompt": text
-    }).encode("utf-8")
-
-    req = request.Request(
-        EMBED_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["embedding"]
-    except Exception:
-        return np.random.rand(768).tolist()
-
-# -----------------------------
-# 4. Memory
-# -----------------------------
-def save_memory(texts, embeddings):
-    with open(MEMORY_FILE, "w") as f:
-        json.dump({"texts": texts, "embeddings": embeddings}, f)
-
-
-def load_memory():
-    if not os.path.exists(MEMORY_FILE):
-        return None, None
-    with open(MEMORY_FILE, "r") as f:
-        data = json.load(f)
-        return data["texts"], data["embeddings"]
-
-# -----------------------------
-# 5. Initialize
-# -----------------------------
-texts, embeddings = load_memory()
-
-if texts is None:
-    texts = get_initial_data()
-    embeddings = [get_embedding(t) for t in texts]
-    save_memory(texts, embeddings)
-
-personality = load_personality()
-if personality is None:
-    personality = create_personality_profile(texts)
-
-embeddings = np.array(embeddings, dtype=np.float32)
-
-# -----------------------------
-# 6. Retrieval
-# -----------------------------
-def cosine_similarity(a, b):
-    denom = (np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
-
-
-def retrieve(query, k=2):
-    q_vec = np.array(get_embedding(query), dtype=np.float32)
-    scores = [cosine_similarity(q_vec, emb) for emb in embeddings]
-    top_k = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
-    return [texts[i] for i in top_k]
-
-# -----------------------------
-# 7. Add Memory
-# -----------------------------
-def add_memory(new_text):
-    global texts, embeddings
-    texts.append(new_text)
-    new_emb = np.array(get_embedding(new_text), dtype=np.float32)
-    embeddings = np.vstack([embeddings, new_emb])
-    save_memory(texts, embeddings.tolist())
-
-# -----------------------------
-# 8. LLM with Personality
-# -----------------------------
-def ask_llm(prompt, personality, fallback_memories=None):
-
-    persona_prompt = f"""
-You are a digital twin of the user.
-
-Tone: {personality['tone']}
-Style: {personality['style']}
-Interests: {personality['interests']}
-
-Respond in this personality consistently.
-
-{prompt}
-"""
-
-    payload = json.dumps({
-        "model": "mistral",
-        "prompt": persona_prompt,
-        "stream": False
-    }).encode("utf-8")
-
-    req = request.Request(
-        LLM_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("response", "(no response)")
-    except error.URLError:
-        if fallback_memories:
-            return "[Fallback Personality Response] " + " ".join(fallback_memories)
-        return "LLM unavailable"
-
-# -----------------------------
-# 9. Run Query
-# -----------------------------
-query = "What do I like to build?"
-memories = retrieve(query)
-
-context = "\n".join(memories)
-
-prompt = f"""
-Memories:
-{context}
-
-Question:
-{query}
-"""
-
-print("\n=== Retrieved Memory ===")
-print(context)
-
-print("\n=== Personality-Aware Response ===")
-print(ask_llm(prompt, personality, fallback_memories=memories))
-
-# -----------------------------
-# Tests
-# -----------------------------
-assert isinstance(personality, dict)
-assert "tone" in personality
-assert len(retrieve("AI")) > 0
-
-print("\nAll tests passed. Personality modeling active.")
-'''
-
-#new changes 4
-'''
-# PRISM – 100% Demo Pipeline
-# Full System with Chat UI (Streamlit)
-
-"""
-Final Upgrade:
-- Adds a simple Chat UI using Streamlit
-- Uses memory + personality + LLM
-
-Run UI with:
-streamlit run prism_demo.py
-"""
-
-import numpy as np
-import json
-import os
-from urllib import request, error
-import streamlit as st
-
-# -----------------------------
-# Config
-# -----------------------------
-MEMORY_FILE = "memory_store.json"
-PROFILE_FILE = "personality.json"
-EMBED_URL = "http://localhost:11434/api/embeddings"
-LLM_URL = "http://localhost:11434/api/generate"
-
-# -----------------------------
-# Embedding
-# -----------------------------
-def get_embedding(text):
-    payload = json.dumps({
-        "model": "nomic-embed-text",
-        "prompt": text
-    }).encode("utf-8")
-
-    req = request.Request(EMBED_URL, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["embedding"]
-    except:
-        return np.random.rand(768).tolist()
-
-# -----------------------------
-# Memory
-# -----------------------------
-def load_memory():
-    if not os.path.exists(MEMORY_FILE):
-        texts = ["I love robotics", "I build electronics"]
-        embeddings = [get_embedding(t) for t in texts]
-        save_memory(texts, embeddings)
-        return texts, embeddings
-
-    with open(MEMORY_FILE, "r") as f:
-        data = json.load(f)
-        return data["texts"], data["embeddings"]
-
-
-def save_memory(texts, embeddings):
-    with open(MEMORY_FILE, "w") as f:
-        json.dump({"texts": texts, "embeddings": embeddings}, f)
-
-# -----------------------------
-# Personality
-# -----------------------------
-def load_personality():
-    if not os.path.exists(PROFILE_FILE):
-        profile = {"tone": "technical", "style": "clear", "interests": "AI, robotics"}
-        with open(PROFILE_FILE, "w") as f:
-            json.dump(profile, f)
-        return profile
-
-    with open(PROFILE_FILE, "r") as f:
-        return json.load(f)
-
-# -----------------------------
-# Retrieval
-# -----------------------------
-def cosine_similarity(a, b):
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
-
-
-def retrieve(query, texts, embeddings, k=2):
-    q_vec = np.array(get_embedding(query), dtype=np.float32)
-    embeddings = np.array(embeddings, dtype=np.float32)
-    scores = [cosine_similarity(q_vec, emb) for emb in embeddings]
-    top_k = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
-    return [texts[i] for i in top_k]
-
-# -----------------------------
-# LLM
-# -----------------------------
-def ask_llm(prompt, personality):
-    persona_prompt = f"""
-Tone: {personality['tone']}
-Style: {personality['style']}
-Interests: {personality['interests']}
-
-{prompt}
-"""
-
-    payload = json.dumps({
-        "model": "mistral",
-        "prompt": persona_prompt,
-        "stream": False
-    }).encode("utf-8")
-
-    req = request.Request(LLM_URL, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("response", "")
-    except:
-        return "Fallback response based on memory."
-
-# -----------------------------
-# UI (Streamlit)
-# -----------------------------
-st.title("🧠 PRISM Digital Twin")
-
-texts, embeddings = load_memory()
-personality = load_personality()
-
-if "chat" not in st.session_state:
-    st.session_state.chat = []
-
-user_input = st.text_input("Ask something:")
-
-if user_input:
-    memories = retrieve(user_input, texts, embeddings)
-    context = "\n".join(memories)
-
-    prompt = f"""
-Memories:
-{context}
-
-Question:
-{user_input}
-"""
-
-    response = ask_llm(prompt, personality)
-
-    st.session_state.chat.append((user_input, response))
-
-# Display chat
-for q, a in st.session_state.chat:
-    st.write(f"**You:** {q}")
-    st.write(f"**PRISM:** {a}")
-
-'''
-#new changes 5
-'''
-# PRISM – 100% Demo Pipeline
-# Full System with Chat UI (Streamlit)
-
-"""
-Final Upgrade:
-- Adds a simple Chat UI using Streamlit
-- Uses memory + personality + LLM
-
-Run UI with:
-streamlit run prism_demo.py
-"""
-
-import numpy as np
-import json
-import os
-from urllib import request, error
-import streamlit as st
-
-# -----------------------------
-# Config
-# -----------------------------
-MEMORY_FILE = "memory_store.json"
-PROFILE_FILE = "personality.json"
-EMBED_URL = "http://localhost:11434/api/embeddings"
-LLM_URL = "http://localhost:11434/api/generate"
-
-# -----------------------------
-# Embedding
-# -----------------------------
-def get_embedding(text):
-    payload = json.dumps({
-        "model": "nomic-embed-text",
-        "prompt": text
-    }).encode("utf-8")
-
-    req = request.Request(EMBED_URL, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["embedding"]
-    except:
-        return np.random.rand(768).tolist()
-
-# -----------------------------
-# Memory
-# -----------------------------
-def load_memory():
-    if not os.path.exists(MEMORY_FILE):
-        texts = ["I love robotics", "I build electronics"]
-        embeddings = [get_embedding(t) for t in texts]
-        save_memory(texts, embeddings)
-        return texts, embeddings
-
-    with open(MEMORY_FILE, "r") as f:
-        data = json.load(f)
-        return data["texts"], data["embeddings"]
-
-
-def save_memory(texts, embeddings):
-    with open(MEMORY_FILE, "w") as f:
-        json.dump({"texts": texts, "embeddings": embeddings}, f)
-
-# -----------------------------
-# Personality
-# -----------------------------
-def load_personality():
-    if not os.path.exists(PROFILE_FILE):
-        profile = {"tone": "technical", "style": "clear", "interests": "AI, robotics"}
-        with open(PROFILE_FILE, "w") as f:
-            json.dump(profile, f)
-        return profile
-
-    with open(PROFILE_FILE, "r") as f:
-        return json.load(f)
-
-# -----------------------------
-# Retrieval
-# -----------------------------
-def cosine_similarity(a, b):
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
-
-
-def retrieve(query, texts, embeddings, k=2):
-    q_vec = np.array(get_embedding(query), dtype=np.float32)
-    embeddings = np.array(embeddings, dtype=np.float32)
-    scores = [cosine_similarity(q_vec, emb) for emb in embeddings]
-    top_k = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
-    return [texts[i] for i in top_k]
-
-# -----------------------------
-# LLM
-# -----------------------------
-def ask_llm(prompt, personality):
-    persona_prompt = f"""
-Tone: {personality['tone']}
-Style: {personality['style']}
-Interests: {personality['interests']}
-
-{prompt}
-"""
-
-    payload = json.dumps({
-        "model": "mistral",
-        "prompt": persona_prompt,
-        "stream": False
-    }).encode("utf-8")
-
-    req = request.Request(LLM_URL, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("response", "")
-    except:
-        return "Fallback response based on memory."
-
-# -----------------------------
-# UI (Streamlit)
-st.title("🧠 PRISM Digital Twin")
-
-texts, embeddings = load_memory()
-personality = load_personality()
-
-if "chat" not in st.session_state:
-    st.session_state.chat = []
-
-# -----------------------------
-# Add Memory UI
-# -----------------------------
-st.subheader("➕ Add New Memory")
-new_memory = st.text_input("Enter something about yourself:")
-
-if st.button("Save Memory") and new_memory:
-    texts.append(new_memory)
-    embeddings.append(get_embedding(new_memory))
-    save_memory(texts, embeddings)
-    st.success("Memory saved successfully!")
-
-# -----------------------------
-# Chat Input
-# -----------------------------
-user_input = st.text_input("Ask something:")
-
-if user_input:
-    memories = retrieve(user_input, texts, embeddings)
-    context = " ".join(memories)
-
-    prompt = f"""
-Memories:
-{context}
-
-Question:
-{user_input}
-"""
-
-    response = ask_llm(prompt, personality)
-
-    st.session_state.chat.append((user_input, response))
-
-# Display chat
-for q, a in st.session_state.chat:
-    st.write(f"**You:** {q}")
-    st.write(f"**PRISM:** {a}")
-
-'''
-
-#new changes 6
-
-# PRISM – Clean Chat UI Version
-# Minimal UI (Only Functional Parts for Demo)
-
-import numpy as np
-import json
-import os
-from urllib import request
-import streamlit as st
-
-# -----------------------------
-# Config
-# -----------------------------
-MEMORY_FILE = "memory_store.json"
-PROFILE_FILE = "personality.json"
-EMBED_URL = "http://localhost:11434/api/embeddings"
-LLM_URL = "http://localhost:11434/api/generate"
-
-# -----------------------------
-# Embedding
-# -----------------------------
-def get_embedding(text):
-    payload = json.dumps({
-        "model": "nomic-embed-text",
-        "prompt": text
-    }).encode("utf-8")
-
-    req = request.Request(EMBED_URL, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["embedding"]
-    except:
-        return np.random.rand(768).tolist()
-
-# -----------------------------
-# Memory
-# -----------------------------
-def load_memory():
-    if not os.path.exists(MEMORY_FILE):
-        texts = ["I love robotics", "I build electronics"]
-        embeddings = [get_embedding(t) for t in texts]
-        save_memory(texts, embeddings)
-        return texts, embeddings
-
-    with open(MEMORY_FILE, "r") as f:
-        data = json.load(f)
-        return data["texts"], data["embeddings"]
-
-
-def save_memory(texts, embeddings):
-    with open(MEMORY_FILE, "w") as f:
-        json.dump({"texts": texts, "embeddings": embeddings}, f)
-
-# -----------------------------
-# Personality
-# -----------------------------
-def load_personality():
-    if not os.path.exists(PROFILE_FILE):
-        profile = {"tone": "technical", "style": "clear", "interests": "AI, robotics"}
-        with open(PROFILE_FILE, "w") as f:
-            json.dump(profile, f)
-        return profile
-
-    with open(PROFILE_FILE, "r") as f:
-        return json.load(f)
-
-# -----------------------------
-# Retrieval
-# -----------------------------
-def cosine_similarity(a, b):
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
-
-
-def retrieve(query, texts, embeddings, k=2):
-    q_vec = np.array(get_embedding(query), dtype=np.float32)
-    embeddings = np.array(embeddings, dtype=np.float32)
-    scores = [cosine_similarity(q_vec, emb) for emb in embeddings]
-    top_k = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
-    return [texts[i] for i in top_k]
-
-# -----------------------------
-# LLM
-# -----------------------------
-def ask_llm(prompt, personality):
-    persona_prompt = f"""
-Tone: {personality['tone']}
-Style: {personality['style']}
-Interests: {personality['interests']}
-
-{prompt}
-"""
-
-    payload = json.dumps({
-        "model": "mistral",
-        "prompt": persona_prompt,
-        "stream": False
-    }).encode("utf-8")
-
-    req = request.Request(LLM_URL, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-
-    try:
-        with request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("response", "")
-    except:
-        return "Fallback response"
-
-# -----------------------------
-# UI (Clean)
-# -----------------------------
+st.set_page_config(page_title="PRISM Digital Twin", layout="wide")
 st.title("PRISM Digital Twin")
+st.caption("A local assistant with memories you can review and edit.")
 
-texts, embeddings = load_memory()
-personality = load_personality()
+try:
+    db = initialize_memory_store()
+except RuntimeError as exc:
+    st.error(str(exc))
+    st.stop()
 
 if "chat" not in st.session_state:
     st.session_state.chat = []
 
-# Add Memory
-new_memory = st.text_input("Add memory:")
-if st.button("Save") and new_memory:
-    texts.append(new_memory)
-    embeddings.append(get_embedding(new_memory))
-    save_memory(texts, embeddings)
+with st.sidebar:
+    st.header("Memory manager")
+    with st.form("add_memory_form", clear_on_submit=True):
+        new_text = st.text_area("Add a memory", placeholder="Something PRISM should remember")
+        add_clicked = st.form_submit_button("Save memory")
+    if add_clicked:
+        if not new_text.strip():
+            st.warning("Enter some text before saving.")
+        else:
+            try:
+                add_memory(db, new_text.strip())
+                st.success("Memory saved.")
+                st.rerun()
+            except RuntimeError as exc:
+                st.error(str(exc))
 
-# Chat
-user_input = st.text_input("Ask:")
+    memories = list_memories(db)
+    st.caption(f"{len(memories)} saved memor{'y' if len(memories) == 1 else 'ies'}")
+    if memories:
+        labels = {row["id"]: f"{row['id']}: {row['text'][:70]}" for row in memories}
+        selected_id = st.selectbox("Choose a memory to edit", options=list(labels),
+                                   format_func=lambda value: labels[value])
+        selected = next(row for row in memories if row["id"] == selected_id)
+        with st.form("edit_memory_form"):
+            edited_text = st.text_area("Memory text", value=selected["text"], key=f"edit_{selected_id}")
+            save_edit = st.form_submit_button("Update memory")
+        if save_edit:
+            if not edited_text.strip():
+                st.warning("Memory text cannot be empty.")
+            else:
+                try:
+                    update_memory(db, selected_id, edited_text.strip())
+                    st.success("Memory updated.")
+                    st.rerun()
+                except RuntimeError as exc:
+                    st.error(str(exc))
+        if st.button("Delete selected memory", key="delete_memory"):
+            delete_memory(db, selected_id)
+            st.rerun()
+        if st.button("Clear all memories"):
+            db.execute("DELETE FROM memories")
+            db.commit()
+            st.rerun()
+    if st.button("Clear chat history"):
+        st.session_state.chat = []
+        st.rerun()
 
-if user_input:
-    memories = retrieve(user_input, texts, embeddings)
-    context = "\n".join(memories)
+for item in st.session_state.chat:
+    with st.chat_message(item["role"]):
+        st.markdown(item["content"])
+        if item["role"] == "assistant" and item.get("memories"):
+            with st.expander("Memories used"):
+                for memory in item["memories"]:
+                    st.write(f"- {memory}")
 
-    prompt = f"""
-Memories:
-{context}
-
-Question:
-{user_input}
-"""
-
-    response = ask_llm(prompt, personality)
-    st.session_state.chat.append((user_input, response))
-
-# Chat display
-for q, a in st.session_state.chat:
-    st.write(f"You: {q}")
-    st.write(f"PRISM: {a}")
-
+user_text = st.chat_input("Ask PRISM something...")
+if user_text:
+    st.session_state.chat.append({"role": "user", "content": user_text})
+    with st.chat_message("user"):
+        st.markdown(user_text)
+    with st.chat_message("assistant"):
+        try:
+            # Include the immediate context when retrieving so short follow-ups resolve.
+            prior_user = [item["content"] for item in st.session_state.chat[:-1]
+                          if item["role"] == "user"]
+            retrieval_query = "\n".join(prior_user[-2:] + [user_text])
+            relevant = retrieve(retrieval_query, list_memories(db))
+            prompt = build_prompt(st.session_state.chat[:-1], user_text, relevant)
+            answer = ask_llm(prompt)
+            st.markdown(answer)
+            if relevant:
+                with st.expander("Memories used"):
+                    for memory in relevant:
+                        st.write(f"- {memory}")
+            st.session_state.chat.append({"role": "assistant", "content": answer,
+                                          "memories": relevant})
+        except RuntimeError as exc:
+            message = f"I couldn't complete that request: {exc}"
+            st.error(message)
+            st.session_state.chat.append({"role": "assistant", "content": message, "memories": []})
